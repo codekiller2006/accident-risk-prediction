@@ -1,6 +1,12 @@
 import React, { useState, useEffect, useMemo } from "react";
 import axios from "axios";
-import { MapContainer, TileLayer, CircleMarker, Popup } from "react-leaflet";
+import {
+  MapContainer,
+  TileLayer,
+  CircleMarker,
+  Popup,
+  useMap,
+} from "react-leaflet";
 
 const API_BASE = "http://localhost:8000";
 const AUSTIN_CENTER = [30.2672, -97.7431];
@@ -28,7 +34,7 @@ const MONTHS = [
   "Dec",
 ];
 
-// Deterministic visual placement across Austin until exact OSM GeoJSON coordinates are added
+// Fallback placement only if a segment is missing from road_coordinates.csv
 function getApproxCoords(segmentId) {
   const idStr = String(segmentId);
   let h = 2166136261;
@@ -39,6 +45,25 @@ function getApproxCoords(segmentId) {
   const latOffset = (((h >>> 0) % 10000) / 10000 - 0.5) * 0.14;
   const lngOffset = ((((h >>> 12) & 0xffff) % 10000) / 10000 - 0.5) * 0.16;
   return [AUSTIN_CENTER[0] + latOffset, AUSTIN_CENTER[1] + lngOffset];
+}
+
+function resolveCoords(road) {
+  if (
+    road.has_exact_coords &&
+    typeof road.lat === "number" &&
+    typeof road.lon === "number"
+  ) {
+    return [road.lat, road.lon];
+  }
+  return getApproxCoords(road.road_segment_id);
+}
+
+function getRoadLabel(road) {
+  if (!road) return "";
+  if (road.road_name && road.road_name.trim()) {
+    return road.road_name.trim();
+  }
+  return `Segment ${road.road_segment_id}`;
 }
 
 function getTierColor(tier) {
@@ -54,6 +79,102 @@ function getTierColor(tier) {
   }
 }
 
+function formatEnglishList(items) {
+  if (items.length === 0) return "";
+  if (items.length === 1) return items[0];
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(", ")}, and ${items[items.length - 1]}`;
+}
+
+function describeShapFactor(featureName, road, hour, dayOfWeek, month) {
+  if (featureName.startsWith("highway_")) {
+    const rawType = featureName.replace("highway_", "");
+    const cleanType = rawType.replace(/_/g, " ");
+    return road.highway === rawType
+      ? `its classification as a ${cleanType}`
+      : `not being a ${cleanType}`;
+  }
+
+  const isRush =
+    dayOfWeek < 5 && [7, 8, 9, 16, 17, 18].includes(Number(hour));
+
+  switch (featureName) {
+    case "length":
+      return `its segment length (${road.length} m)`;
+    case "maxspeed":
+      return `its ${road.maxspeed} mph speed limit`;
+    case "hour":
+      return `the ${String(hour).padStart(2, "0")}:00 time window`;
+    case "is_rush_hour":
+      return isRush ? "weekday rush-hour traffic" : "off-peak traffic hours";
+    case "is_weekend":
+      return dayOfWeek >= 5
+        ? "weekend traffic patterns"
+        : "weekday commuter traffic";
+    case "day_of_week":
+      return `${DAYS[dayOfWeek]} traffic patterns`;
+    case "month":
+      return `seasonal trends in ${MONTHS[month - 1]}`;
+    case "lanes":
+      return `having ${road.lanes} lane${Number(road.lanes) === 1 ? "" : "s"}`;
+    case "oneway":
+      return road.oneway ? "being a one-way corridor" : "two-way traffic flow";
+    case "start_node_centrality":
+      return "intersection network connectivity";
+    default:
+      return featureName.replace(/_/g, " ");
+  }
+}
+
+function buildShapNarrative(explanation, road, hour, dayOfWeek, month) {
+  if (!explanation || !road || !explanation.top_factors?.length) return null;
+
+  const subject =
+    road.road_name && road.road_name.trim()
+      ? `${road.road_name.trim()} (segment ${road.road_segment_id})`
+      : `Segment ${road.road_segment_id}`;
+
+  const raisers = explanation.top_factors
+    .filter((f) => f.shap_value > 0.02)
+    .slice(0, 3)
+    .map((f) => describeShapFactor(f.feature, road, hour, dayOfWeek, month));
+
+  const reducers = explanation.top_factors
+    .filter((f) => f.shap_value < -0.02)
+    .slice(0, 2)
+    .map((f) => describeShapFactor(f.feature, road, hour, dayOfWeek, month));
+
+  const mainLine =
+    raisers.length > 0
+      ? `${subject} has a ${explanation.risk_tier} relative risk score (${explanation.risk_score}%), pushed up primarily by ${formatEnglishList(
+          raisers
+        )}.`
+      : `${subject} has a ${explanation.risk_tier} relative risk score (${explanation.risk_score}%), with no single feature strongly elevating risk.`;
+
+  const offsetLine =
+    reducers.length > 0
+      ? `Risk is partially offset by ${formatEnglishList(reducers)}.`
+      : `None of the top model factors meaningfully reduce risk during this time slot.`;
+
+  return `${mainLine} ${offsetLine}`;
+}
+
+function MapBoundsController({ hotspots }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (!hotspots || hotspots.length === 0) return;
+    const points = hotspots.map((r) => r.coords);
+    if (points.length === 1) {
+      map.setView(points[0], 13);
+    } else {
+      map.fitBounds(points, { padding: [32, 32], maxZoom: 13 });
+    }
+  }, [hotspots, map]);
+
+  return null;
+}
+
 export default function App() {
   // Global filters
   const [hour, setHour] = useState(17);
@@ -62,8 +183,10 @@ export default function App() {
   const [highwayFilter, setHighwayFilter] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
 
-  // API data
+  // API metadata & data
   const [highwayTypes, setHighwayTypes] = useState([]);
+  const [coordinatesLoaded, setCoordinatesLoaded] = useState(false);
+  const [mappedRoadsCount, setMappedRoadsCount] = useState(0);
   const [summary, setSummary] = useState(null);
   const [hotspots, setHotspots] = useState([]);
   const [selectedRoad, setSelectedRoad] = useState(null);
@@ -86,6 +209,8 @@ export default function App() {
       .get(`${API_BASE}/`)
       .then((res) => {
         setHighwayTypes(res.data.highway_types || []);
+        setCoordinatesLoaded(Boolean(res.data.coordinates_loaded));
+        setMappedRoadsCount(Number(res.data.mapped_roads_count || 0));
         setApiError("");
       })
       .catch(() => {
@@ -120,7 +245,7 @@ export default function App() {
           ? Number(overrides.maxspeed)
           : Number(road.maxspeed),
       oneway: Number(road.oneway),
-      start_node_centrality: Number(road.start_node_centrality),
+      start_node_centrality: Number(road.start_node_centrality || 0),
     };
   };
 
@@ -172,7 +297,7 @@ export default function App() {
         setSummary(res.data.summary);
         const enriched = res.data.hotspots.map((r) => ({
           ...r,
-          coords: getApproxCoords(r.road_segment_id),
+          coords: resolveCoords(r),
         }));
         setHotspots(enriched);
         if (enriched.length > 0) {
@@ -225,7 +350,8 @@ export default function App() {
     return hotspots.filter(
       (r) =>
         r.road_segment_id.toLowerCase().includes(q) ||
-        r.highway.toLowerCase().includes(q)
+        r.highway.toLowerCase().includes(q) ||
+        (r.road_name && r.road_name.toLowerCase().includes(q))
     );
   }, [hotspots, searchQuery]);
 
@@ -240,6 +366,11 @@ export default function App() {
       })
       .join(" ");
   }, [timeline]);
+
+  const shapNarrative = useMemo(
+    () => buildShapNarrative(explanation, selectedRoad, hour, dayOfWeek, month),
+    [explanation, selectedRoad, hour, dayOfWeek, month]
+  );
 
   return (
     <div
@@ -420,9 +551,10 @@ export default function App() {
             >
               <div>
                 <h2 style={styles.cardTitle}>Austin Risk Map</h2>
-                <span style={{ fontSize: "11px", color: "#64748b" }}>
-                  Click any hotspot marker to inspect SHAP drivers & 24-hour
-                  profile (approx. coordinates)
+                <span style={{ fontSize: "11px", color: "#94a3b8" }}>
+                  {coordinatesLoaded
+                    ? `Exact OSM street midpoints (${mappedRoadsCount.toLocaleString()} roads mapped) • Click any pin to inspect`
+                    : "Click any hotspot marker to inspect SHAP drivers & 24-hour profile (approx. coordinates)"}
                 </span>
               </div>
               <div
@@ -457,6 +589,7 @@ export default function App() {
                   attribution="© OpenStreetMap contributors"
                   url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                 />
+                <MapBoundsController hotspots={filteredHotspots} />
                 {filteredHotspots.map((road) => {
                   const isSelected =
                     selectedRoad?.road_segment_id === road.road_segment_id;
@@ -465,18 +598,26 @@ export default function App() {
                     <CircleMarker
                       key={road.road_segment_id}
                       center={road.coords}
-                      radius={isSelected ? 13 : 8}
+                      radius={isSelected ? 12 : 8}
                       pathOptions={{
                         color: isSelected ? "#ffffff" : color,
                         weight: isSelected ? 2.5 : 1.5,
                         fillColor: color,
-                        fillOpacity: 0.8,
+                        fillOpacity: 0.85,
                       }}
                       eventHandlers={{ click: () => inspectRoad(road) }}
                     >
                       <Popup>
                         <div style={{ fontSize: "12px", lineHeight: 1.5 }}>
-                          <strong>Segment {road.road_segment_id}</strong>
+                          <strong>{getRoadLabel(road)}</strong>
+                          {road.road_name && (
+                            <>
+                              <br />
+                              <span style={{ color: "#94a3b8", fontSize: "11px" }}>
+                                ID: {road.road_segment_id}
+                              </span>
+                            </>
+                          )}
                           <br />
                           Risk:{" "}
                           <strong style={{ color }}>
@@ -487,6 +628,12 @@ export default function App() {
                           {road.lanes} lanes
                           <br />
                           Historical Crashes: {road.historical_accidents}
+                          <br />
+                          <span style={{ color: "#94a3b8", fontSize: "10px" }}>
+                            {road.has_exact_coords
+                              ? `OSM Midpoint: ${road.coords[0].toFixed(4)}, ${road.coords[1].toFixed(4)}`
+                              : "Approx. fallback coordinate"}
+                          </span>
                         </div>
                       </Popup>
                     </CircleMarker>
@@ -520,7 +667,7 @@ export default function App() {
             </div>
             <input
               type="text"
-              placeholder="Search segment ID or road type..."
+              placeholder="Search street name, segment ID, or road type..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               style={{
@@ -567,15 +714,18 @@ export default function App() {
                         transition: "border-color 0.15s",
                       }}
                     >
-                      <div>
+                      <div style={{ minWidth: 0, paddingRight: "8px" }}>
                         <div
                           style={{
                             fontWeight: 600,
                             fontSize: "13px",
                             color: "#f8fafc",
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
                           }}
                         >
-                          #{idx + 1} • {road.road_segment_id}
+                          #{idx + 1} • {getRoadLabel(road)}
                         </div>
                         <div
                           style={{
@@ -597,6 +747,7 @@ export default function App() {
                           borderRadius: "6px",
                           fontSize: "12px",
                           fontWeight: 700,
+                          flexShrink: 0,
                         }}
                       >
                         {road.risk_score}%
@@ -622,7 +773,7 @@ export default function App() {
             <h2 style={styles.cardTitle}>24-Hour Risk Forecast</h2>
             <p style={styles.subtext}>
               {selectedRoad
-                ? `Segment ${selectedRoad.road_segment_id} across ${DAYS[dayOfWeek]} (${MONTHS[month - 1]})`
+                ? `${getRoadLabel(selectedRoad)} across ${DAYS[dayOfWeek]} (${MONTHS[month - 1]})`
                 : "Select a segment to view its hourly curve."}
             </p>
             {timeline.length > 0 && (
@@ -691,16 +842,14 @@ export default function App() {
                 }}
               >
                 <div>
+                  Road Class:{" "}
+                  <strong>{selectedRoad.highway.replace(/_/g, " ")}</strong>
+                </div>
+                <div>
                   Length: <strong>{selectedRoad.length} m</strong>
                 </div>
                 <div>
                   One-Way: <strong>{selectedRoad.oneway ? "Yes" : "No"}</strong>
-                </div>
-                <div>
-                  Centrality:{" "}
-                  <strong>
-                    {Number(selectedRoad.start_node_centrality).toExponential(2)}
-                  </strong>
                 </div>
                 <div>
                   Past Crashes:{" "}
@@ -710,7 +859,7 @@ export default function App() {
             )}
           </div>
 
-          {/* 2. SHAP Explainability */}
+          {/* 2. SHAP Explainability + Plain-English Summary */}
           <div style={styles.card}>
             <h2 style={styles.cardTitle}>SHAP Risk Attribution</h2>
             <p style={styles.subtext}>
@@ -718,18 +867,50 @@ export default function App() {
                 ? `Model feature contributions • Base log-odds: ${explanation.base_value}`
                 : "Select a road segment to inspect feature impact."}
             </p>
+
+            {shapNarrative && (
+              <div
+                style={{
+                  background: "#0f172a",
+                  borderLeft: "3px solid #38bdf8",
+                  borderRadius: "6px",
+                  padding: "10px 12px",
+                  marginTop: "10px",
+                  fontSize: "12px",
+                  lineHeight: 1.5,
+                  color: "#e2e8f0",
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: "10px",
+                    fontWeight: 700,
+                    color: "#38bdf8",
+                    letterSpacing: "0.05em",
+                    marginBottom: "4px",
+                  }}
+                >
+                  IN PLAIN ENGLISH
+                </div>
+                {shapNarrative}
+              </div>
+            )}
+
             {explanation && (
               <div
                 style={{
                   display: "flex",
                   flexDirection: "column",
-                  gap: "10px",
-                  marginTop: "10px",
+                  gap: "9px",
+                  marginTop: "12px",
                 }}
               >
                 {explanation.top_factors.map((f) => {
                   const isPos = f.shap_value > 0;
-                  const pct = Math.min((Math.abs(f.shap_value) / 1.5) * 100, 100);
+                  const pct = Math.min(
+                    (Math.abs(f.shap_value) / 1.5) * 100,
+                    100
+                  );
                   return (
                     <div key={f.feature} style={{ fontSize: "12px" }}>
                       <div
